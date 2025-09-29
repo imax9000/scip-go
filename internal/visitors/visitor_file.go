@@ -48,7 +48,7 @@ func NewFileVisitor(
 		pkg:           pkg,
 		file:          file,
 		pkgLookup:     pkgLookup,
-		locals:        map[token.Pos]string{},
+		locals:        map[token.Pos]lookup.Local{},
 		pkgSymbols:    pkgSymbols,
 		globalSymbols: globalSymbols,
 		occurrences:   occurrences,
@@ -77,8 +77,8 @@ type fileVisitor struct {
 	// soething
 	pkgLookup loader.PackageLookup
 
-	// local definition position to symbol
-	locals map[token.Pos]string
+	// local definition position to symbol and its type information
+	locals map[token.Pos]lookup.Local
 
 	// field definition position to symbol for the package
 	pkgSymbols *lookup.Package
@@ -103,13 +103,19 @@ type fileVisitor struct {
 // Implements ast.Visitor
 var _ ast.Visitor = &fileVisitor{}
 
-func (f *fileVisitor) createNewLocalSymbol(pos token.Pos) string {
-	if _, ok := f.locals[pos]; ok {
+func (v *fileVisitor) createNewLocalSymbol(pos token.Pos, obj types.Object) string {
+	if _, ok := v.locals[pos]; ok {
 		panic("Cannot create a new local symbol for an ident that has already been created")
 	}
 
-	f.locals[pos] = fmt.Sprintf("local %d", len(f.locals))
-	return f.locals[pos]
+	symbol := fmt.Sprintf("local %d", len(v.locals))
+
+	v.locals[pos] = lookup.Local{
+		Symbol: symbol,
+		Obj:    obj,
+	}
+
+	return symbol
 }
 
 func (v *fileVisitor) Visit(n ast.Node) ast.Visitor {
@@ -127,16 +133,19 @@ func (v *fileVisitor) Visit(n ast.Node) ast.Visitor {
 		}
 
 		if node.Name != nil && node.Name.Name != "." {
-			sym := v.createNewLocalSymbol(node.Name.Pos())
-			v.NewDefinition(sym, symbols.RangeFromName(v.pkg.Fset.Position(node.Name.Pos()), node.Name.Name, false))
+			pkgAlias := v.pkg.TypesInfo.Defs[node.Name]
+			symName := v.createNewLocalSymbol(node.Name.Pos(), pkgAlias)
+			rangeFromName := symbols.RangeFromName(
+				v.pkg.Fset.Position(node.Name.Pos()), node.Name.Name, false)
+			v.NewDefinition(symName, rangeFromName)
 
 			// Save package name override, so that we use the new local symbol
 			// within this file
-			v.overrides.pkgNameOverride[newtypes.GetID(importedPackage)] = sym
+			v.overrides.pkgNameOverride[newtypes.GetID(importedPackage)] = symName
 		}
 
 		position := v.pkg.Fset.Position(node.Path.Pos())
-		v.emitImportReference(v.globalSymbols, v.doc, position, importedPackage)
+		v.emitImportReference(v.globalSymbols, position, importedPackage)
 
 		return nil
 
@@ -197,8 +206,8 @@ func (v *fileVisitor) Visit(n ast.Node) ast.Visitor {
 
 		// Short circuit on case clauses
 		if obj, ok := v.overrides.caseClauses[node.Pos()]; ok {
-			sym := v.createNewLocalSymbol(obj.Pos())
-			v.NewDefinition(sym, scipRange(position, obj))
+			symName := v.createNewLocalSymbol(obj.Pos(), obj)
+			v.NewDefinition(symName, scipRange(position, obj))
 			return nil
 		}
 
@@ -207,16 +216,16 @@ func (v *fileVisitor) Visit(n ast.Node) ast.Visitor {
 		// Emit Definition
 		def := info.Defs[node]
 		if def != nil {
-			var sym string
+			var symName string
 			if pkgSymbols, ok := v.pkgSymbols.GetSymbol(def.Pos()); ok {
-				sym = pkgSymbols
+				symName = pkgSymbols
 			} else if globalSymbol, ok := v.globalSymbols.GetSymbol(v.pkg, def.Pos()); ok {
-				sym = globalSymbol
+				symName = globalSymbol
 			} else {
-				sym = v.createNewLocalSymbol(def.Pos())
+				symName = v.createNewLocalSymbol(def.Pos(), def)
 			}
 
-			v.NewDefinition(sym, scipRange(position, def))
+			v.NewDefinition(symName, scipRange(position, def))
 		}
 
 		// Emit Reference
@@ -228,7 +237,7 @@ func (v *fileVisitor) Visit(n ast.Node) ast.Visitor {
 			)
 
 			if localSymbol, ok := v.locals[ref.Pos()]; ok {
-				symbol = localSymbol
+				symbol = localSymbol.Symbol
 
 				if _, ok := v.overrides.caseClauses[ref.Pos()]; ok {
 					overrideType = v.pkg.TypesInfo.TypeOf(node)
@@ -285,17 +294,16 @@ func (v *fileVisitor) Visit(n ast.Node) ast.Visitor {
 
 func (v *fileVisitor) emitImportReference(
 	globalSymbols *lookup.Global,
-	doc *document.Document,
 	position token.Position,
 	importedPackage *packages.Package,
 ) {
 	scipRange := symbols.RangeFromName(position, importedPackage.PkgPath, true)
-	symbol := globalSymbols.GetPkgNameSymbol(importedPackage)
-	if symbol == nil {
+	if scipRange == nil {
 		handler.ErrOrPanic("Missing symbol for package path: %s", importedPackage.ID)
 		return
 	}
 
+	symbol := globalSymbols.GetPkgNameSymbol(importedPackage)
 	if symbol == nil {
 		handler.ErrOrPanic("Missing symbol information for package: %s", importedPackage.ID)
 		return
@@ -338,10 +346,22 @@ func (v *fileVisitor) ToScipDocument() *scip.Document {
 	}
 
 	documentSymbols := v.pkgSymbols.SymbolsForFile(documentFile)
-	for _, localSymbol := range v.locals {
-		documentSymbols = append(documentSymbols, &scip.SymbolInformation{
-			Symbol: localSymbol,
-		})
+	for _, local := range v.locals {
+		symbolInfo := &scip.SymbolInformation{
+			Symbol: local.Symbol,
+		}
+
+		if obj := local.Obj; obj != nil {
+			symbolInfo.DisplayName = obj.Name()
+			if txt := local.SignatureText(); txt != "" {
+				symbolInfo.SignatureDocumentation = &scip.Document{
+					Language: "go",
+					Text:     txt,
+				}
+			}
+		}
+
+		documentSymbols = append(documentSymbols, symbolInfo)
 	}
 
 	return &scip.Document{
